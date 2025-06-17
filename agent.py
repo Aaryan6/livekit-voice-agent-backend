@@ -1,4 +1,8 @@
 import logging
+import json
+from datetime import datetime
+from typing import Dict, List, Optional
+from enum import Enum
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -15,39 +19,149 @@ from livekit.agents import (
 from livekit.plugins import (
     cartesia,
     openai,
-    deepgram,
     noise_cancellation,
     silero,
-    google,
     groq
 )
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+# Import our interview configuration
+try:
+    from interview_config import (
+        ROLE_TEMPLATES, 
+        SCORING_RUBRIC, 
+        SkillLevel,
+        get_questions_for_role_and_level,
+        get_evaluation_criteria
+    )
+except ImportError:
+    # Fallback if config file doesn't exist
+    ROLE_TEMPLATES = {}
+    SCORING_RUBRIC = {}
+    SkillLevel = None
 
 load_dotenv(dotenv_path=".env.local")
-logger = logging.getLogger("voice-agent")
+logger = logging.getLogger("interview-agent")
 
 
-class Assistant(Agent):
-    def __init__(self) -> None:
-        # This project is configured to use Deepgram STT, OpenAI LLM and Cartesia TTS plugins
-        # Other great providers exist like Cerebras, ElevenLabs, Groq, Play.ht, Rime, and more
-        # Learn more and pick the best one for your app:
-        # https://docs.livekit.io/agents/plugins
+class InterviewStage(Enum):
+    ONBOARDING = "onboarding"
+    TECHNICAL_ASSESSMENT = "technical_assessment"
+    CANDIDATE_QUESTIONS = "candidate_questions"
+    WRAP_UP = "wrap_up"
+    COMPLETED = "completed"
+
+
+class InterviewAgent(Agent):
+    def __init__(self, 
+                 role: str = "Software Engineer", 
+                 candidate_name: str = "Candidate",
+                 skill_level: str = "mid") -> None:
         super().__init__(
-            instructions=instructions("Build Your Future", "Aaryan Patel"),
+            instructions=get_interview_instructions(role, candidate_name, skill_level),
             stt=groq.STT(),
             llm=openai.LLM(model="gpt-4o-mini"),
             tts=cartesia.TTS(),
-            # use LiveKit's transformer-based turn detector
             turn_detection="vad",
         )
+        self.role = role
+        self.candidate_name = candidate_name
+        self.skill_level = SkillLevel(skill_level) if SkillLevel else skill_level
+        self.current_stage = InterviewStage.ONBOARDING
+        self.current_competency_index = 0
+        self.interview_data = {
+            "start_time": datetime.now().isoformat(),
+            "role": role,
+            "candidate_name": candidate_name,
+            "skill_level": skill_level,
+            "competencies_covered": [],
+            "scores": {},
+            "notes": {},
+            "stage": self.current_stage.value,
+            "duration_minutes": 0,
+            "questions_asked": [],
+            "evaluation_summary": {}
+        }
 
     async def on_enter(self):
-        # The agent should be polite and greet the user when it joins :)
-        self.session.generate_reply(
-            instructions="Hey, how can I help you today?", allow_interruptions=True
+        # Start the interview immediately with a direct greeting and first question
+        await self.session.say(
+            self.get_introduction_script(),
+            allow_interruptions=True
         )
+
+    def get_introduction_script(self) -> str:
+        """Get concise role-specific introduction script"""
+        return f"Hello {self.candidate_name}! I'm your interviewer for this {self.role} position. Let's start with our first question: Can you explain the time complexity of binary search?"
+
+    def get_competencies(self) -> List:
+        """Get competencies for the current role"""
+        if self.role in ROLE_TEMPLATES:
+            return ROLE_TEMPLATES[self.role].competencies
+        return []
+
+    def log_interview_data(self, stage: str, data: Dict):
+        """Log interview progress and data for quality assurance"""
+        self.interview_data["stage"] = stage
+        self.interview_data[stage] = data
+        self.interview_data["duration_minutes"] = (
+            datetime.now() - datetime.fromisoformat(self.interview_data["start_time"])
+        ).total_seconds() / 60
+        logger.info(f"Interview stage: {stage}, Data: {json.dumps(data, indent=2)}")
+
+    def update_competency_score(self, competency_name: str, score: int, evidence: str):
+        """Update score for a specific competency"""
+        self.interview_data["scores"][competency_name] = {
+            "score": score,
+            "evidence": evidence,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    def get_interview_summary(self) -> Dict:
+        """Generate final interview summary"""
+        competencies = self.get_competencies()
+        total_weighted_score = 0
+        total_weight = 0
+        
+        summary = {
+            "candidate": self.candidate_name,
+            "role": self.role,
+            "duration_minutes": self.interview_data["duration_minutes"],
+            "competency_scores": {},
+            "overall_recommendation": "",
+            "strengths": [],
+            "areas_for_improvement": [],
+            "detailed_feedback": {}
+        }
+        
+        for competency in competencies:
+            if competency.name in self.interview_data["scores"]:
+                score_data = self.interview_data["scores"][competency.name]
+                weighted_score = score_data["score"] * competency.weight
+                total_weighted_score += weighted_score
+                total_weight += competency.weight
+                
+                summary["competency_scores"][competency.name] = {
+                    "score": score_data["score"],
+                    "weight": competency.weight,
+                    "weighted_score": weighted_score,
+                    "evidence": score_data["evidence"]
+                }
+        
+        # Calculate overall score
+        overall_score = total_weighted_score / total_weight if total_weight > 0 else 0
+        summary["overall_score"] = round(overall_score, 2)
+        
+        # Generate recommendation
+        if overall_score >= 4.0:
+            summary["overall_recommendation"] = "Strong Hire"
+        elif overall_score >= 3.5:
+            summary["overall_recommendation"] = "Hire"
+        elif overall_score >= 2.5:
+            summary["overall_recommendation"] = "Borderline - Additional Assessment Needed"
+        else:
+            summary["overall_recommendation"] = "No Hire"
+        
+        return summary
 
 
 def prewarm(proc: JobProcess):
@@ -60,7 +174,7 @@ async def entrypoint(ctx: JobContext):
 
     # Wait for the first participant to connect
     participant = await ctx.wait_for_participant()
-    logger.info(f"starting voice assistant for participant {participant.identity}")
+    logger.info(f"starting technical interview for participant {participant.identity}")
 
     usage_collector = metrics.UsageCollector()
 
@@ -71,10 +185,9 @@ async def entrypoint(ctx: JobContext):
 
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
-        # minimum delay for endpointing, used when turn detector believes the user is done with their turn
-        min_endpointing_delay=0.5,
-        # maximum delay for endpointing, used when turn detector does not believe the user is done with their turn
-        max_endpointing_delay=5.0,
+        # Adjusted for interview context - longer delays for thinking time
+        min_endpointing_delay=1.0,
+        max_endpointing_delay=8.0,
     )
 
     # Trigger the on_metrics_collected function when metrics are collected
@@ -82,53 +195,58 @@ async def entrypoint(ctx: JobContext):
 
     await session.start(
         room=ctx.room,
-        agent=Assistant(),
+        agent=InterviewAgent(
+            role="Software Engineer",  # This can be customized via environment variables
+            candidate_name=participant.identity or "Candidate",
+            skill_level="mid"  # This can also be customized
+        ),
         room_input_options=RoomInputOptions(
-            # enable background voice & noise cancellation, powered by Krisp
-            # included at no additional cost with LiveKit Cloud
             noise_cancellation=noise_cancellation.BVC(),
         ),
     )
 
 
-def instructions(event_name: str, name: str):
+def get_interview_instructions(role: str, candidate_name: str, skill_level: str) -> str:
+    """Generate concise interview instructions for brief, focused responses"""
+    
     return f"""
-    You are a professional feedback agent conducting a real-time voice feedback session with a user. Your goal is to collect feedback from the user.
-[Identity]  
-You are BuildFast Bot, a feedback collection agent designed to gather customer insights in a short, focused manner. Your role is to collect useful feedback efficiently while respecting the user's time.
+You are the INTERVIEWER conducting a technical interview for a {role} position. {candidate_name} is the CANDIDATE you are evaluating.
 
-[Style]  
-- Sound professional and courteous.  
-- Keep conversations concise and focused.  
-- Use a neutral tone to avoid bias.  
-- Maintain a friendly demeanor throughout.
-- Always use the person's name to make the conversation more personalized.
-- Reference the event name when asking questions about it.
+CRITICAL RULES:
+- You are the interviewer, NOT the candidate
+- Keep ALL responses brief - maximum 1-2 sentences
+- NEVER speak ratings or scores out loud (e.g., never say "Rating: 1")
+- Keep all evaluation completely silent and internal
+- Never explain the interview agenda or structure to the candidate
+- Never say "This interview will take 60 minutes" or list the areas you'll cover
+- Never ask "Do you have questions before we begin?"
+- Just greet and immediately ask technical questions
 
-[Response Guidelines]  
-- Ensure questions are clear and easy to understand.  
-- Allow space after open-ended questions for the respondent to think.  
-- Acknowledge all feedback neutrally and without judgment.  
-- Handle ambiguous answers by asking for clarification.
-- Address the user by name in each question to make the conversation more engaging.
-- If the user answers negatively or rates 5 or less , then give response in a sorrow manner.
-- If the user says no if doesnt like anything or has no feedbacks then answer in a sorrow manner.
+YOUR ROLE: 
+- YOU ask technical questions to evaluate {candidate_name}
+- {candidate_name} provides answers to YOUR questions
+- Keep questions short and direct
 
-[Task & Goals]  
-1. Follow this exact conversation flow:
-   - Introduce yourself: "I am BuildFast Bot; I will collect feedback for the {event_name}. The call will take 3-5 min."
-   - Ask what they do: "What do you do {name}?"
-   - Ask for rating: "How would you rate the {event_name} on a scale of one to ten, {name}?"
-   - Ask what they liked: "What did you love most about the {event_name}?"
-   - Ask for improvement suggestions: "What suggestions do you have? "
-   - Ask about program interest: "Also we’ve built an 8-week Generative AI Launchpad to get you hands-on with AI — would you like to join or learn more? "
-   - End with: "Thanks for your feedback on the {event_name}.  Have a great day {name}!"
+CORE GUIDELINES:
+- Be extremely concise - no verbose explanations
+- Ask one technical question at a time
+- Never provide interview overviews or agendas
+- Skip pleasantries and get straight to technical questions
 
-[Error Handling / Fallback]  
-- If the user's response is unclear, politely ask for clarification: "Could you please elaborate on that?"  
-- Handle unexpected inputs by acknowledging and attempting to redirect: "I appreciate your input. Let's move to the next question."  
-- In case of technical issues, reassure the user: "I apologize for the inconvenience. Let's continue where we left off."
-    """
+RESPONSE STYLE:
+- Maximum 1-2 sentences per response
+- Ask one clear technical question
+- No agenda explanations or time breakdowns
+- No "welcome speeches" or procedural explanations
+
+EVALUATION (SILENT - NEVER SPEAK RATINGS):
+- Rate competencies 1-5 based on {candidate_name}'s answers
+- NEVER say ratings out loud to the candidate
+- Keep all scoring completely silent and internal
+- Never say "Rating: 1" or mention scores verbally
+
+Start with brief greeting and immediate technical question - no agenda or explanations.
+"""
 
 
 if __name__ == "__main__":
