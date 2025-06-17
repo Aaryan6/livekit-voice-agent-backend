@@ -1,5 +1,7 @@
 import logging
 import json
+import os
+import aiohttp
 from datetime import datetime
 from typing import Dict, List, Optional
 from enum import Enum
@@ -168,6 +170,28 @@ def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
 
+async def fetch_user_info_from_api(participant_id: str, room_name: str) -> Optional[Dict]:
+    """Fetch user information from Next.js API endpoint"""
+    api_url = os.getenv('NEXTJS_API_URL', 'http://localhost:3000')
+    endpoint = f"{api_url}/api/interview-info"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                endpoint,
+                params={'participantId': participant_id, 'roomName': room_name},
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    logger.warning(f"API request failed with status: {response.status}")
+                    return None
+    except Exception as e:
+        logger.error(f"Failed to fetch user info from API: {e}")
+        return None
+
+
 async def entrypoint(ctx: JobContext):
     logger.info(f"connecting to room {ctx.room.name}")
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
@@ -175,6 +199,39 @@ async def entrypoint(ctx: JobContext):
     # Wait for the first participant to connect
     participant = await ctx.wait_for_participant()
     logger.info(f"starting technical interview for participant {participant.identity}")
+
+    # Extract user information from room name and participant metadata
+    role = "Software Engineer"  # default
+    skill_level = "mid"  # default
+    candidate_name = participant.identity or "Candidate"
+    
+    # Option 1: Parse from room name (format: interview-name-skill-timestamp)
+    room_parts = ctx.room.name.split('-')
+    if len(room_parts) >= 3 and room_parts[0] == 'interview':
+        candidate_name = room_parts[1].replace('_', ' ')
+        skill_level = room_parts[2]
+    
+    # Option 2: Parse from participant metadata (preferred)
+    if participant.metadata:
+        try:
+            metadata = json.loads(participant.metadata)
+            role = metadata.get('role', role)
+            skill_level = metadata.get('skill', skill_level)
+            logger.info(f"Using metadata - Role: {role}, Skill: {skill_level}")
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse participant metadata")
+    
+    # Option 3: Fetch from Next.js API endpoint
+    api_user_info = await fetch_user_info_from_api(participant.identity, ctx.room.name)
+    if api_user_info:
+        candidate_name = api_user_info.get('candidateName', candidate_name)
+        skill_level = api_user_info.get('skillLevel', skill_level)
+        role = api_user_info.get('role', role)
+        logger.info(f"Using API data - Name: {candidate_name}, Role: {role}, Skill: {skill_level}")
+    
+    # Option 4: Parse from environment variables (fallback)
+    role = os.getenv('INTERVIEW_ROLE', role)
+    skill_level = os.getenv('INTERVIEW_SKILL_LEVEL', skill_level)
 
     usage_collector = metrics.UsageCollector()
 
@@ -196,9 +253,9 @@ async def entrypoint(ctx: JobContext):
     await session.start(
         room=ctx.room,
         agent=InterviewAgent(
-            role="Software Engineer",  # This can be customized via environment variables
-            candidate_name=participant.identity or "Candidate",
-            skill_level="mid"  # This can also be customized
+            role=role,
+            candidate_name=candidate_name,
+            skill_level=skill_level
         ),
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
