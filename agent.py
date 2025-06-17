@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 from enum import Enum
 
 from dotenv import load_dotenv
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -23,7 +24,8 @@ from livekit.plugins import (
     openai,
     noise_cancellation,
     silero,
-    groq
+    groq,
+    deepgram
 )
 
 # Import our interview configuration
@@ -60,10 +62,10 @@ class InterviewAgent(Agent):
                  skill_level: str = "mid") -> None:
         super().__init__(
             instructions=get_interview_instructions(role, candidate_name, skill_level),
-            stt=groq.STT(),
+            stt=deepgram.STT(model="nova-2-meeting"),
             llm=openai.LLM(model="gpt-4o-mini"),
             tts=cartesia.TTS(),
-            turn_detection="vad",
+            turn_detection=MultilingualModel(),
         )
         self.role = role
         self.candidate_name = candidate_name
@@ -92,8 +94,8 @@ class InterviewAgent(Agent):
         )
 
     def get_introduction_script(self) -> str:
-        """Get concise role-specific introduction script"""
-        return f"Hello {self.candidate_name}! I'm your interviewer for this {self.role} position. Let's start with our first question: Can you explain the time complexity of binary search?"
+        """Get conversational role-specific introduction script"""
+        return f"Hello {self.candidate_name}! I'm your interviewer for this {self.role} position. I'll be asking you some technical questions today. Let's start with: Can you explain the time complexity of binary search?"
 
     def get_competencies(self) -> List:
         """Get competencies for the current role"""
@@ -264,45 +266,44 @@ async def entrypoint(ctx: JobContext):
 
 
 def get_interview_instructions(role: str, candidate_name: str, skill_level: str) -> str:
-    """Generate concise interview instructions for brief, focused responses"""
+    """Generate interview instructions for responsive, conversational behavior"""
     
     return f"""
-You are the INTERVIEWER conducting a technical interview for a {role} position. {candidate_name} is the CANDIDATE you are evaluating.
+You are an INTERVIEWER conducting a technical interview for a {role} position. {candidate_name} is the CANDIDATE you are evaluating.
 
-CRITICAL RULES:
+CRITICAL BEHAVIOR RULES:
 - You are the interviewer, NOT the candidate
-- Keep ALL responses brief - maximum 1-2 sentences
+- ALWAYS respond to what the candidate just said before asking the next question
+- Be conversational and natural - acknowledge their answers
 - NEVER speak ratings or scores out loud (e.g., never say "Rating: 1")
 - Keep all evaluation completely silent and internal
-- Never explain the interview agenda or structure to the candidate
-- Never say "This interview will take 60 minutes" or list the areas you'll cover
-- Never ask "Do you have questions before we begin?"
-- Just greet and immediately ask technical questions
 
-YOUR ROLE: 
-- YOU ask technical questions to evaluate {candidate_name}
-- {candidate_name} provides answers to YOUR questions
-- Keep questions short and direct
+CONVERSATIONAL FLOW:
+1. LISTEN to {candidate_name}'s answer
+2. ACKNOWLEDGE their response (brief comment on their answer)
+3. ASK a follow-up question or move to next topic
 
-CORE GUIDELINES:
-- Be extremely concise - no verbose explanations
-- Ask one technical question at a time
-- Never provide interview overviews or agendas
-- Skip pleasantries and get straight to technical questions
+RESPONSE PATTERNS:
+- If they give a good answer: "That's correct! Now let me ask you about..."
+- If they give a partial answer: "I see, that covers part of it. Can you also explain..."
+- If they don't know: "No problem, let's try a different topic. What about..."
+- If they ask to repeat: "Of course! I asked about..." then repeat the question
+- If they give unclear answer: "Could you clarify what you mean by..."
 
-RESPONSE STYLE:
-- Maximum 1-2 sentences per response
-- Ask one clear technical question
-- No agenda explanations or time breakdowns
-- No "welcome speeches" or procedural explanations
+YOUR INTERVIEWING STYLE:
+- Be responsive and adaptive to their answers
+- Ask follow-up questions based on their responses
+- Show you're listening by referencing what they said
+- Keep questions concise but be conversational
+- Help them if they're struggling, then move to next topic
 
 EVALUATION (SILENT - NEVER SPEAK RATINGS):
 - Rate competencies 1-5 based on {candidate_name}'s answers
 - NEVER say ratings out loud to the candidate
 - Keep all scoring completely silent and internal
-- Never say "Rating: 1" or mention scores verbally
+- Never mention scores verbally
 
-Start with brief greeting and immediate technical question - no agenda or explanations.
+REMEMBER: Always acknowledge their answer first, then ask your next question. Be a human interviewer, not a question robot.
 """
 
 
