@@ -20,7 +20,6 @@ from livekit.agents import (
     RoomInputOptions,
 )
 from livekit.plugins import (
-    cartesia,
     openai,
     noise_cancellation,
     silero,
@@ -48,9 +47,9 @@ logger = logging.getLogger("interview-agent")
 
 
 class InterviewStage(Enum):
-    ONBOARDING = "onboarding"
-    TECHNICAL_ASSESSMENT = "technical_assessment"
-    CANDIDATE_QUESTIONS = "candidate_questions"
+    INTRODUCTION = "introduction"
+    PROJECTS_DISCUSSION = "projects_discussion"
+    TECHNICAL_QUESTIONS = "technical_questions"
     WRAP_UP = "wrap_up"
     COMPLETED = "completed"
 
@@ -64,13 +63,13 @@ class InterviewAgent(Agent):
             instructions=get_interview_instructions(role, candidate_name, skill_level),
             stt=deepgram.STT(model="nova-2-meeting"),
             llm=openai.LLM(model="gpt-4o-mini"),
-            tts=cartesia.TTS(),
+            tts=openai.TTS(voice="alloy"),
             turn_detection=MultilingualModel(),
         )
         self.role = role
         self.candidate_name = candidate_name
         self.skill_level = SkillLevel(skill_level) if SkillLevel else skill_level
-        self.current_stage = InterviewStage.ONBOARDING
+        self.current_stage = InterviewStage.INTRODUCTION
         self.current_competency_index = 0
         self.interview_data = {
             "start_time": datetime.now().isoformat(),
@@ -87,7 +86,7 @@ class InterviewAgent(Agent):
         }
 
     async def on_enter(self):
-        # Start the interview immediately with a direct greeting and first question
+        # Start the interview with introduction
         await self.session.say(
             self.get_introduction_script(),
             allow_interruptions=True
@@ -95,7 +94,7 @@ class InterviewAgent(Agent):
 
     def get_introduction_script(self) -> str:
         """Get conversational role-specific introduction script"""
-        return f"Hello {self.candidate_name}! I'm your interviewer for this {self.role} position. I'll be asking you some technical questions today. Let's start with: Can you explain the time complexity of binary search?"
+        return f"Hello {self.candidate_name}! I'm your interviewer for this {self.role} position. Thank you for taking the time to interview with us today. To start, could you please introduce yourself and tell me a bit about your background?"
 
     def get_competencies(self) -> List:
         """Get competencies for the current role"""
@@ -271,6 +270,11 @@ def get_interview_instructions(role: str, candidate_name: str, skill_level: str)
     return f"""
 You are an INTERVIEWER conducting a technical interview for a {role} position. {candidate_name} is the CANDIDATE you are evaluating.
 
+INTERVIEW FLOW (3 STAGES):
+1. INTRODUCTION STAGE: Ask candidate to introduce themselves and their background
+2. PROJECTS STAGE: Ask about their projects, experience, and work they've done
+3. TECHNICAL STAGE: Ask skill-based questions related to their projects or general technical knowledge
+
 CRITICAL BEHAVIOR RULES:
 - You are the interviewer, NOT the candidate
 - ALWAYS respond to what the candidate just said before asking the next question
@@ -281,10 +285,15 @@ CRITICAL BEHAVIOR RULES:
 CONVERSATIONAL FLOW:
 1. LISTEN to {candidate_name}'s answer
 2. ACKNOWLEDGE their response (brief comment on their answer)
-3. ASK a follow-up question or move to next topic
+3. ASK a follow-up question or move to next topic/stage
+
+STAGE-SPECIFIC GUIDANCE:
+INTRODUCTION: "Tell me about yourself and your background"
+PROJECTS: "Can you walk me through some projects you've worked on?" "What technologies did you use?" "What challenges did you face?"
+TECHNICAL: Ask questions based on technologies/concepts mentioned in their projects, or general {role} skills
 
 RESPONSE PATTERNS:
-- If they give a good answer: "That's correct! Now let me ask you about..."
+- If they give a good answer: "That's interesting! Now let me ask you about..."
 - If they give a partial answer: "I see, that covers part of it. Can you also explain..."
 - If they don't know: "No problem, let's try a different topic. What about..."
 - If they ask to repeat: "Of course! I asked about..." then repeat the question
@@ -296,6 +305,7 @@ YOUR INTERVIEWING STYLE:
 - Show you're listening by referencing what they said
 - Keep questions concise but be conversational
 - Help them if they're struggling, then move to next topic
+- Connect technical questions to their mentioned projects when possible
 
 EVALUATION (SILENT - NEVER SPEAK RATINGS):
 - Rate competencies 1-5 based on {candidate_name}'s answers
@@ -303,7 +313,7 @@ EVALUATION (SILENT - NEVER SPEAK RATINGS):
 - Keep all scoring completely silent and internal
 - Never mention scores verbally
 
-REMEMBER: Always acknowledge their answer first, then ask your next question. Be a human interviewer, not a question robot.
+REMEMBER: Follow the 3-stage flow: Introduction → Projects → Technical Questions. Always acknowledge their answer first, then ask your next question. Be a human interviewer, not a question robot.
 """
 
 
