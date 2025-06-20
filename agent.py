@@ -24,7 +24,8 @@ from livekit.plugins import (
     noise_cancellation,
     silero,
     groq,
-    deepgram
+    deepgram,
+    elevenlabs
 )
 
 # Import our interview configuration
@@ -63,7 +64,7 @@ class InterviewAgent(Agent):
             instructions=get_interview_instructions(role, candidate_name, skill_level),
             stt=deepgram.STT(model="nova-2-meeting"),
             llm=openai.LLM(model="gpt-4o-mini"),
-            tts=openai.TTS(voice="alloy"),
+            tts=elevenlabs.TTS(),
             turn_detection=MultilingualModel(),
         )
         self.role = role
