@@ -2,9 +2,12 @@ import logging
 import json
 import os
 import aiohttp
-from datetime import datetime
-from typing import Dict, List, Optional
+import re
+import asyncio
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
 from enum import Enum
+import random
 
 from dotenv import load_dotenv
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -47,9 +50,9 @@ logger = logging.getLogger("interview-agent")
 
 
 class InterviewStage(Enum):
+    WELCOME = "welcome"
     INTRODUCTION = "introduction"
-    PROJECTS_DISCUSSION = "projects_discussion"
-    TECHNICAL_QUESTIONS = "technical_questions"
+    QUESTIONS = "questions"
     WRAP_UP = "wrap_up"
     COMPLETED = "completed"
 
@@ -69,102 +72,428 @@ class InterviewAgent(Agent):
         self.role = role
         self.candidate_name = candidate_name
         self.skill_level = SkillLevel(skill_level) if SkillLevel else skill_level
-        self.current_stage = InterviewStage.INTRODUCTION
-        self.current_competency_index = 0
+        self.current_stage = InterviewStage.WELCOME
+        self.current_question_index = 0
+        self.max_questions = 5
+        
+        # Get predefined questions for this role and skill level
+        self.predefined_questions = self._get_predefined_questions()
+        self.mandatory_questions = self.predefined_questions.copy()  # All are mandatory
+        
+        # Timing tracking
+        self.start_time = datetime.now()
+        self.stage_start_time = datetime.now()
+        self.candidate_speaking_time = timedelta()
+        self.last_candidate_start = None
+        
+        # Grammar tracking
+        self.candidate_responses = []
+        self.grammar_assessments = []
+        
         self.interview_data = {
-            "start_time": datetime.now().isoformat(),
+            "start_time": self.start_time.isoformat(),
             "role": role,
             "candidate_name": candidate_name,
             "skill_level": skill_level,
-            "competencies_covered": [],
-            "scores": {},
-            "notes": {},
-            "stage": self.current_stage.value,
-            "duration_minutes": 0,
+            "predefined_questions": self.predefined_questions,
             "questions_asked": [],
-            "evaluation_summary": {}
+            "questions_missed": [],
+            "candidate_responses": [],
+            "grammar_assessments": [],
+            "stage_timings": {},
+            "total_candidate_speaking_time_seconds": 0,
+            "total_interview_duration_minutes": 0,
+            "current_stage": self.current_stage.value
         }
 
+    def _get_predefined_questions(self) -> List[str]:
+        """Get exactly 5 predefined questions for the role and skill level"""
+        if self.role not in ROLE_TEMPLATES or not SkillLevel:
+            # Fallback questions if config not available
+            return [
+                "Tell me about your experience with programming languages.",
+                "Describe a challenging project you've worked on.",
+                "How do you approach debugging complex issues?",
+                "What's your experience with version control systems?",
+                "How do you stay updated with new technologies?"
+            ]
+        
+        template = ROLE_TEMPLATES[self.role]
+        all_questions = []
+        
+        # Collect questions from all competencies for the skill level
+        for competency in template.competencies:
+            competency_questions = competency.questions.get(self.skill_level, [])
+            all_questions.extend(competency_questions)
+        
+        # Select exactly 5 questions, prioritizing diverse competencies
+        if len(all_questions) <= 5:
+            return all_questions
+        else:
+            # Randomly select 5 questions to ensure variety
+            return random.sample(all_questions, 5)
+
+    def _assess_grammar_accuracy(self, response_text: str) -> Dict:
+        """Assess grammar accuracy of candidate response"""
+        # Basic grammar assessment using simple heuristics
+        # In production, this could use an NLP service like Grammarly API
+        
+        # Count basic grammar issues
+        issues = []
+        words = response_text.split()
+        word_count = len(words)
+        
+        # Basic checks
+        if not response_text.strip():
+            return {"accuracy_percentage": 0, "issues": ["Empty response"], "word_count": 0}
+        
+        # Check for basic punctuation
+        sentences = response_text.split('.')
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if sentence and not sentence[0].isupper():
+                issues.append("Missing capitalization")
+        
+        # Check for common grammar patterns
+        text_lower = response_text.lower()
+        common_errors = [
+            ("i ", "I "),  # Lowercase 'i'
+            ("dont", "don't"),
+            ("cant", "can't"),
+            ("wont", "won't"),
+            ("its ", "it's " if "it is" in text_lower else "its "),
+        ]
+        
+        for error, correction in common_errors:
+            if error in text_lower:
+                issues.append(f"Grammar: '{error.strip()}' should be '{correction.strip()}'")
+        
+        # Calculate accuracy (simplified approach)
+        accuracy_percentage = max(0, 100 - (len(issues) * 10))  # Each issue reduces by 10%
+        
+        assessment = {
+            "accuracy_percentage": accuracy_percentage,
+            "issues": issues[:5],  # Limit to 5 issues for brevity
+            "word_count": word_count,
+            "meets_threshold": accuracy_percentage >= 70
+        }
+        
+        return assessment
+
+    def _update_candidate_speaking_time(self, start_time: datetime, end_time: datetime):
+        """Update the total time candidate has been speaking"""
+        duration = end_time - start_time
+        self.candidate_speaking_time += duration
+        self.interview_data["total_candidate_speaking_time_seconds"] = self.candidate_speaking_time.total_seconds()
+
+    def _log_stage_timing(self, stage: str):
+        """Log timing for stage transitions"""
+        now = datetime.now()
+        if hasattr(self, 'stage_start_time'):
+            duration = now - self.stage_start_time
+            self.interview_data["stage_timings"][stage] = {
+                "start_time": self.stage_start_time.isoformat(),
+                "end_time": now.isoformat(),
+                "duration_seconds": duration.total_seconds()
+            }
+        self.stage_start_time = now
+
     async def on_enter(self):
-        # Start the interview with introduction
-        await self.session.say(
-            self.get_introduction_script(),
-            allow_interruptions=True
-        )
+        """Start the interview with welcome message"""
+        self.current_stage = InterviewStage.WELCOME
+        self._log_stage_timing("welcome")
+        
+        welcome_message = f"""Hello {self.candidate_name}! Welcome to your interview for the {self.role} position. 
 
-    def get_introduction_script(self) -> str:
-        """Get conversational role-specific introduction script"""
-        return f"Hello {self.candidate_name}! I'm your interviewer for this {self.role} position. Thank you for taking the time to interview with us today. To start, could you please introduce yourself and tell me a bit about your background?"
+I'm excited to speak with you today. Please feel free to take your time with your answers and ask for clarification if needed.
 
-    def get_competencies(self) -> List:
-        """Get competencies for the current role"""
-        if self.role in ROLE_TEMPLATES:
-            return ROLE_TEMPLATES[self.role].competencies
-        return []
+Let's begin! Could you please introduce yourself and tell me about your background?"""
+
+        await self.session.say(welcome_message, allow_interruptions=True)
+        self.current_stage = InterviewStage.INTRODUCTION
+        await self._send_progress_update()
+
+    async def on_user_speech_committed(self, msg):
+        """Handle candidate responses and track timing/grammar"""
+        now = datetime.now()
+        
+        # Track candidate speaking time
+        if self.last_candidate_start:
+            self._update_candidate_speaking_time(self.last_candidate_start, now)
+        
+        response_text = msg.transcript.strip()
+        if not response_text:
+            return
+        
+        # Store the response
+        self.candidate_responses.append({
+            "timestamp": now.isoformat(),
+            "stage": self.current_stage.value,
+            "question_index": self.current_question_index if self.current_stage == InterviewStage.QUESTIONS else None,
+            "response": response_text
+        })
+        
+        # Assess grammar if it's a substantial response (more than 5 words)
+        if len(response_text.split()) > 5:
+            grammar_assessment = self._assess_grammar_accuracy(response_text)
+            grammar_assessment["timestamp"] = now.isoformat()
+            grammar_assessment["stage"] = self.current_stage.value
+            grammar_assessment["response_text"] = response_text
+            self.grammar_assessments.append(grammar_assessment)
+            self.interview_data["grammar_assessments"] = self.grammar_assessments
+        
+        # Handle automatic stage progression
+        await self._handle_stage_progression(response_text)
+
+    async def on_user_started_speaking(self):
+        """Track when candidate starts speaking"""
+        self.last_candidate_start = datetime.now()
+
+    async def on_session_disconnected(self):
+        """Handle session disconnect and generate final summary"""
+        logger.info(f"Session disconnected - current stage: {self.current_stage.value}")
+        if self.current_stage != InterviewStage.COMPLETED:
+            logger.info("Session disconnected, generating final summary...")
+            await self.generate_final_summary()
+            self.current_stage = InterviewStage.COMPLETED
+        else:
+            logger.info("Session disconnected but interview already completed")
+
+    async def on_participant_disconnected(self, participant):
+        """Handle participant disconnect and generate final summary"""
+        logger.info(f"Participant {participant.identity} disconnected - current stage: {self.current_stage.value}")
+        if self.current_stage != InterviewStage.COMPLETED:
+            logger.info(f"Participant {participant.identity} disconnected, generating final summary...")
+            await self.generate_final_summary()
+            self.current_stage = InterviewStage.COMPLETED
+        else:
+            logger.info("Participant disconnected but interview already completed")
+
+    async def on_shutdown(self):
+        """Handle agent shutdown and generate final summary"""
+        if self.current_stage != InterviewStage.COMPLETED:
+            logger.info("Agent shutting down, generating final summary...")
+            await self.generate_final_summary()
+            self.current_stage = InterviewStage.COMPLETED
+
+    async def _send_progress_update(self):
+        """Send progress update to frontend"""
+        try:
+            progress_data = {
+                "type": "progress_update",
+                "current_stage": self.current_stage.value,
+                "questions_asked": len(self.interview_data["questions_asked"]),
+                "total_questions": self.max_questions,
+                "current_question_index": self.current_question_index,
+                "elapsed_time": int((datetime.now() - self.start_time).total_seconds()),
+                "candidate_speaking_time": int(self.candidate_speaking_time.total_seconds())
+            }
+            
+            # Send data to frontend via room data channel
+            await self.session.room.local_participant.publish_data(
+                json.dumps(progress_data).encode("utf-8"),
+                reliable=True
+            )
+            logger.info(f"Sent progress update: {progress_data}")
+        except Exception as e:
+            logger.error(f"Failed to send progress update: {e}")
+
+    async def _handle_stage_progression(self, response_text: str):
+        """Handle automatic progression through interview stages"""
+        # Don't interrupt if agent is currently speaking
+        if self.session.agent_is_speaking:
+            return
+            
+        # Introduction stage: after candidate introduces themselves, start questions
+        if self.current_stage == InterviewStage.INTRODUCTION:
+            # Look for introduction keywords or substantial response
+            if len(response_text.split()) > 10:  # Substantial introduction
+                # Wait a moment then transition to questions
+                await asyncio.sleep(2)
+                await self.session.say(
+                    "Thank you for that introduction! Now I'd like to ask you some specific technical questions.",
+                    allow_interruptions=True
+                )
+                await asyncio.sleep(1)
+                await self._ask_next_question()
+        
+        # Questions stage: after each answer, ask next question
+        elif self.current_stage == InterviewStage.QUESTIONS:
+            # Check if this was a response to a question
+            if len(response_text.split()) > 3:  # Substantial answer
+                await asyncio.sleep(1.5)  # Brief pause
+                await self._ask_next_question()
+
+    async def _ask_next_question(self):
+        """Ask the next predefined question"""
+        if self.current_question_index >= len(self.predefined_questions):
+            await self._wrap_up_interview()
+            return
+        
+        if self.current_stage != InterviewStage.QUESTIONS:
+            self.current_stage = InterviewStage.QUESTIONS
+            self._log_stage_timing("questions")
+            await self._send_progress_update()
+        
+        question = self.predefined_questions[self.current_question_index]
+        
+        # Log the question as asked
+        self.interview_data["questions_asked"].append({
+            "index": self.current_question_index,
+            "question": question,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # Varied ways to introduce questions naturally
+        question_intros = [
+            f"Great! {question}",
+            f"Perfect. {question}",
+            f"Thank you for that. {question}",
+            f"Excellent. Now, {question}",
+            f"That's good. {question}"
+        ]
+        
+        # Use different intro based on question index to sound natural
+        intro_index = self.current_question_index % len(question_intros)
+        question_intro = question_intros[intro_index]
+        
+        await self.session.say(question_intro, allow_interruptions=True)
+        self.current_question_index += 1
+        await self._send_progress_update()
+
+    async def _wrap_up_interview(self):
+        """Wrap up the interview and generate summary"""
+        self.current_stage = InterviewStage.WRAP_UP
+        self._log_stage_timing("wrap_up")
+        await self._send_progress_update()
+        
+        wrap_up_message = f"""Thank you {self.candidate_name}, that completes our technical discussion. 
+
+Do you have any questions about the role, the team, or our company that I can answer for you?
+
+We'll review your responses and follow up with next steps within a few business days. Thank you for your time today!"""
+
+        await self.session.say(wrap_up_message, allow_interruptions=True)
+        
+        # Generate final summary
+        await self.generate_final_summary()
+        self.current_stage = InterviewStage.COMPLETED
+        await self._send_progress_update()
+
+    async def generate_final_summary(self):
+        """Generate comprehensive interview summary"""
+        logger.info("Starting generation of final interview summary...")
+        end_time = datetime.now()
+        total_duration = end_time - self.start_time
+        
+        # Update final timing data
+        self.interview_data["total_interview_duration_minutes"] = total_duration.total_seconds() / 60
+        self.interview_data["end_time"] = end_time.isoformat()
+        
+        # Calculate mandatory questions coverage
+        questions_asked_count = len(self.interview_data["questions_asked"])
+        questions_missed_count = len(self.predefined_questions) - questions_asked_count
+        self.interview_data["questions_missed"] = self.predefined_questions[questions_asked_count:] if questions_missed_count > 0 else []
+        
+        # Calculate grammar accuracy metrics
+        overall_grammar_score = self._calculate_overall_grammar_accuracy()
+        qa_grammar_issues = self._calculate_qa_grammar_issues()
+        
+        # Generate comprehensive summary
+        summary = {
+            "interview_metadata": {
+                "candidate_name": self.candidate_name,
+                "role": self.role,
+                "skill_level": self.skill_level.value if hasattr(self.skill_level, 'value') else self.skill_level,
+                "interview_date": self.start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "total_duration_minutes": round(self.interview_data["total_interview_duration_minutes"], 2),
+                "candidate_speaking_time_minutes": round(self.interview_data["total_candidate_speaking_time_seconds"] / 60, 2),
+                "interviewer_time_percentage": round((1 - (self.interview_data["total_candidate_speaking_time_seconds"] / total_duration.total_seconds())) * 100, 1)
+            },
+            
+            "questions_coverage": {
+                "total_predefined_questions": len(self.predefined_questions),
+                "questions_asked_count": questions_asked_count,
+                "questions_missed_count": questions_missed_count,
+                "all_mandatory_questions_asked": questions_missed_count == 0,
+                "questions_asked": [q["question"] for q in self.interview_data["questions_asked"]],
+                "questions_missed": self.interview_data["questions_missed"]
+            },
+            
+            "grammar_assessment": {
+                "overall_feedback": {
+                    "average_accuracy_percentage": round(overall_grammar_score, 1),
+                    "meets_70_percent_threshold": overall_grammar_score >= 70,
+                    "assessment": "Yes" if overall_grammar_score >= 70 else "No"
+                },
+                "qa_section_feedback": {
+                    "total_answers_assessed": len([g for g in self.grammar_assessments if g["stage"] == "questions"]),
+                    "answers_below_70_percent": qa_grammar_issues,
+                    "answers_with_poor_grammar_count": qa_grammar_issues
+                }
+            },
+            
+            "stage_timings": self.interview_data["stage_timings"],
+            "detailed_responses": self.candidate_responses,
+            "detailed_grammar_assessments": self.grammar_assessments
+        }
+        
+        # Log the comprehensive summary
+        logger.info("=== INTERVIEW SUMMARY ===")
+        logger.info(json.dumps(summary, indent=2))
+        
+        # Store in interview_data for potential API access
+        self.interview_data["final_summary"] = summary
+        
+        # Send summary to frontend
+        await self._send_summary_to_frontend(summary)
+        
+        return summary
+
+    async def _send_summary_to_frontend(self, summary):
+        """Send final summary to frontend"""
+        try:
+            logger.info("Preparing to send interview summary to frontend...")
+            summary_data = {
+                "type": "interview_complete",
+                "summary": summary
+            }
+            
+            # Check if session and room are still available
+            if not self.session or not self.session.room:
+                logger.warning("Session or room not available, cannot send summary to frontend")
+                return
+            
+            # Send summary data to frontend
+            await self.session.room.local_participant.publish_data(
+                json.dumps(summary_data).encode("utf-8"),
+                reliable=True
+            )
+            logger.info("Successfully sent interview summary to frontend")
+        except Exception as e:
+            logger.error(f"Failed to send summary to frontend: {e}")
+            logger.error(f"Exception details: {type(e).__name__}: {str(e)}")
+
+    def _calculate_overall_grammar_accuracy(self) -> float:
+        """Calculate overall grammar accuracy across all responses"""
+        if not self.grammar_assessments:
+            return 0.0
+        
+        total_accuracy = sum(assessment["accuracy_percentage"] for assessment in self.grammar_assessments)
+        return total_accuracy / len(self.grammar_assessments)
+
+    def _calculate_qa_grammar_issues(self) -> int:
+        """Count number of Q&A answers with grammar accuracy below 70%"""
+        qa_assessments = [g for g in self.grammar_assessments if g["stage"] == "questions"]
+        return sum(1 for assessment in qa_assessments if assessment["accuracy_percentage"] < 70)
 
     def log_interview_data(self, stage: str, data: Dict):
         """Log interview progress and data for quality assurance"""
         self.interview_data["stage"] = stage
         self.interview_data[stage] = data
-        self.interview_data["duration_minutes"] = (
-            datetime.now() - datetime.fromisoformat(self.interview_data["start_time"])
-        ).total_seconds() / 60
         logger.info(f"Interview stage: {stage}, Data: {json.dumps(data, indent=2)}")
 
-    def update_competency_score(self, competency_name: str, score: int, evidence: str):
-        """Update score for a specific competency"""
-        self.interview_data["scores"][competency_name] = {
-            "score": score,
-            "evidence": evidence,
-            "timestamp": datetime.now().isoformat()
-        }
 
-    def get_interview_summary(self) -> Dict:
-        """Generate final interview summary"""
-        competencies = self.get_competencies()
-        total_weighted_score = 0
-        total_weight = 0
-        
-        summary = {
-            "candidate": self.candidate_name,
-            "role": self.role,
-            "duration_minutes": self.interview_data["duration_minutes"],
-            "competency_scores": {},
-            "overall_recommendation": "",
-            "strengths": [],
-            "areas_for_improvement": [],
-            "detailed_feedback": {}
-        }
-        
-        for competency in competencies:
-            if competency.name in self.interview_data["scores"]:
-                score_data = self.interview_data["scores"][competency.name]
-                weighted_score = score_data["score"] * competency.weight
-                total_weighted_score += weighted_score
-                total_weight += competency.weight
-                
-                summary["competency_scores"][competency.name] = {
-                    "score": score_data["score"],
-                    "weight": competency.weight,
-                    "weighted_score": weighted_score,
-                    "evidence": score_data["evidence"]
-                }
-        
-        # Calculate overall score
-        overall_score = total_weighted_score / total_weight if total_weight > 0 else 0
-        summary["overall_score"] = round(overall_score, 2)
-        
-        # Generate recommendation
-        if overall_score >= 4.0:
-            summary["overall_recommendation"] = "Strong Hire"
-        elif overall_score >= 3.5:
-            summary["overall_recommendation"] = "Hire"
-        elif overall_score >= 2.5:
-            summary["overall_recommendation"] = "Borderline - Additional Assessment Needed"
-        else:
-            summary["overall_recommendation"] = "No Hire"
-        
-        return summary
 
 
 def prewarm(proc: JobProcess):
@@ -265,55 +594,79 @@ async def entrypoint(ctx: JobContext):
 
 
 def get_interview_instructions(role: str, candidate_name: str, skill_level: str) -> str:
-    """Generate interview instructions for responsive, conversational behavior"""
+    """Generate interview instructions for structured interview with exactly 5 questions"""
     
     return f"""
-You are an INTERVIEWER conducting a technical interview for a {role} position. {candidate_name} is the CANDIDATE you are evaluating.
+You are an INTERVIEWER conducting a structured technical interview for a {role} position. {candidate_name} is the CANDIDATE you are evaluating.
 
-INTERVIEW FLOW (3 STAGES):
-1. INTRODUCTION STAGE: Ask candidate to introduce themselves and their background
-2. PROJECTS STAGE: Ask about their projects, experience, and work they've done
-3. TECHNICAL STAGE: Ask skill-based questions related to their projects or general technical knowledge
+INTERVIEW STRUCTURE (4 STAGES):
+1. WELCOME: Greet candidate and explain the interview process (already handled)
+2. INTRODUCTION: Listen to candidate's self-introduction and background  
+3. QUESTIONS: Ask exactly 5 predefined technical questions (agent will provide them)
+4. WRAP-UP: Thank candidate and conclude the interview
 
 CRITICAL BEHAVIOR RULES:
 - You are the interviewer, NOT the candidate
-- ALWAYS respond to what the candidate just said before asking the next question
-- Be conversational and natural - acknowledge their answers
-- NEVER speak ratings or scores out loud (e.g., never say "Rating: 1")
-- Keep all evaluation completely silent and internal
+- NEVER provide answers to your own questions
+- NEVER give solutions, hints, or technical explanations during the interview
+- NEVER ask about personal life, family, age, religion, politics, or any non-professional topics
+- Be conversational and acknowledge their answers naturally
+- NEVER speak ratings, scores, or evaluations out loud
+- Keep all assessment completely silent and internal
+- The interview system will automatically manage question flow
 
-CONVERSATIONAL FLOW:
-1. LISTEN to {candidate_name}'s answer
-2. ACKNOWLEDGE their response (brief comment on their answer)
-3. ASK a follow-up question or move to next topic/stage
+FORBIDDEN TOPICS AND BEHAVIORS:
+- Do NOT provide answers or solutions to technical questions
+- Do NOT give hints or clues about correct answers
+- Do NOT ask about personal relationships, marital status, family plans
+- Do NOT discuss politics, religion, or controversial topics
+- Do NOT ask about age, health conditions, or disabilities
+- Do NOT make assumptions about candidate's background based on name or accent
+- Do NOT share your own technical opinions or preferences during evaluation
 
-STAGE-SPECIFIC GUIDANCE:
-INTRODUCTION: "Tell me about yourself and your background"
-PROJECTS: "Can you walk me through some projects you've worked on?" "What technologies did you use?" "What challenges did you face?"
-TECHNICAL: Ask questions based on technologies/concepts mentioned in their projects, or general {role} skills
+CURRENT STAGE BEHAVIOR:
 
-RESPONSE PATTERNS:
-- If they give a good answer: "That's interesting! Now let me ask you about..."
-- If they give a partial answer: "I see, that covers part of it. Can you also explain..."
-- If they don't know: "No problem, let's try a different topic. What about..."
-- If they ask to repeat: "Of course! I asked about..." then repeat the question
-- If they give unclear answer: "Could you clarify what you mean by..."
+INTRODUCTION STAGE:
+- Listen to {candidate_name}'s PROFESSIONAL self-introduction and background
+- Ask 1-2 natural follow-up questions about their WORK experience if needed
+- Keep questions focused on professional experience, skills, and career
+- Once you have good understanding of their background, acknowledge and transition to technical questions
+- The system will automatically provide the next question
 
-YOUR INTERVIEWING STYLE:
-- Be responsive and adaptive to their answers
-- Ask follow-up questions based on their responses
-- Show you're listening by referencing what they said
-- Keep questions concise but be conversational
-- Help them if they're struggling, then move to next topic
-- Connect technical questions to their mentioned projects when possible
+QUESTIONS STAGE:
+- Acknowledge each answer they give naturally WITHOUT revealing correctness
+- Ask for clarification if an answer is unclear or incomplete
+- NEVER provide the correct answer if they struggle
+- After they complete their answer, the system will automatically provide the next question
+- You will ask exactly 5 technical questions total
+- Be encouraging and professional throughout
+- If they don't know an answer, simply say "That's okay" and move on
 
-EVALUATION (SILENT - NEVER SPEAK RATINGS):
-- Rate competencies 1-5 based on {candidate_name}'s answers
-- NEVER say ratings out loud to the candidate
-- Keep all scoring completely silent and internal
-- Never mention scores verbally
+WRAP-UP STAGE:
+- After 5 questions, thank them for their responses
+- Ask if they have any questions about the role, team, or company
+- Conclude professionally and mention next steps
 
-REMEMBER: Follow the 3-stage flow: Introduction → Projects → Technical Questions. Always acknowledge their answer first, then ask your next question. Be a human interviewer, not a question robot.
+SAFE CONVERSATIONAL PATTERNS:
+- Good answer: "Thank you for that explanation."
+- Partial answer: "I see. Could you elaborate on [specific part]?"
+- Unclear answer: "Could you help me understand what you mean by...?"
+- Don't know: "No problem, that's perfectly fine."
+- NEVER say: "That's correct/incorrect" or "The right answer is..."
+
+EVALUATION (COMPLETELY SILENT):
+- Observe and assess {candidate_name}'s responses internally
+- Track grammar, clarity, technical knowledge, problem-solving approach
+- NEVER speak any evaluation out loud
+- All assessment happens silently in the background
+
+REMEMBER: 
+- Be a professional, neutral interviewer
+- Let candidates provide their own answers without help
+- Keep the conversation strictly professional and technical
+- Acknowledge their answers before moving on
+- The system handles question progression automatically
+- Focus on being responsive and encouraging while maintaining professionalism
 """
 
 
