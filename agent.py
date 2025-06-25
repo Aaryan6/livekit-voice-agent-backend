@@ -75,7 +75,7 @@ class InterviewSessionData:
     projects_mentioned: List[str] = None
     hobbies_mentioned: List[str] = None
     total_questions_count: int = 0
-    max_questions: int = 10
+    max_questions: int = 4  # Reduced for testing
     
     def __post_init__(self):
         if self.competencies_covered is None:
@@ -98,7 +98,7 @@ class IntroductionAgent(Agent):
     def __init__(self, chat_ctx: ChatContext = None) -> None:
         super().__init__(
             instructions=self.get_introduction_instructions(),
-            stt=deepgram.STT(model="nova-2-meeting"),
+            stt=openai.STT(model="whisper-1"),
             llm=openai.LLM(model="gpt-4o-mini"),
             tts=openai.TTS(),
             turn_detection=MultilingualModel(),
@@ -164,7 +164,7 @@ class ProjectsAgent(Agent):
     def __init__(self, chat_ctx: ChatContext = None) -> None:
         super().__init__(
             instructions=self.get_projects_instructions(),
-            stt=deepgram.STT(model="nova-2-meeting"),
+            stt=openai.STT(model="whisper-1"),
             llm=openai.LLM(model="gpt-4o-mini"),
             tts=openai.TTS(),
             turn_detection=MultilingualModel(),
@@ -239,7 +239,7 @@ class TechnicalQuestionsAgent(Agent):
     def __init__(self, chat_ctx: ChatContext = None) -> None:
         super().__init__(
             instructions=self.get_technical_instructions(),
-            stt=deepgram.STT(model="nova-2-meeting"),
+            stt=openai.STT(model="whisper-1"),
             llm=openai.LLM(model="gpt-4o-mini"),
             tts=openai.TTS(),
             turn_detection=MultilingualModel(),
@@ -248,17 +248,18 @@ class TechnicalQuestionsAgent(Agent):
 
     async def on_enter(self) -> None:
         userdata: InterviewSessionData = self.session.userdata
-        remaining_questions = userdata.max_questions - userdata.total_questions_count
         
-        if remaining_questions <= 2:
-            await self.session.say(
-                "Let me ask you one quick technical question based on your experience."
-            )
-        else:
-            await self.session.say(
-                "Now let's dive into some technical questions. "
-                "I'll ask you a few questions based on your experience and the role."
-            )
+        await self.session.say(
+            "Hello! I'm going to test the coding interface with you. "
+            "I'll open a Python code interpreter for you now."
+        )
+        
+        # Force the tool call immediately without waiting for LLM
+        await self.open_code_interpreter(
+            self.session.run_context,
+            question="Write a Python function that takes a list of integers and returns the sum of all even numbers in the list. For example, if the input is [1, 2, 3, 4, 5, 6], your function should return 12 (2 + 4 + 6).",
+            language="python"
+        )
 
     @function_tool()
     async def ask_technical_question(self, context: RunContext[InterviewSessionData], question: str, competency: str):
@@ -319,7 +320,54 @@ class TechnicalQuestionsAgent(Agent):
             return f"Error opening code editor: {str(e)}"
 
     @function_tool()
-    async def analyze_submitted_code(self, context: RunContext[InterviewSessionData], code: str, language: str, explanation: str, question: str):
+    async def open_code_interpreter(self, context: RunContext[InterviewSessionData], question: str, language: str = "python"):
+        """Use this tool to open a code interpreter for Python coding questions. This provides an interactive environment where the candidate can write and execute Python code."""
+        try:
+            # Get the participant identity (assuming single participant for now)
+            job_ctx = get_job_context()
+            
+            # Get the first remote participant
+            remote_participants = list(job_ctx.room.remote_participants.keys())
+            if not remote_participants:
+                raise Exception("No remote participants found")
+            
+            participant_identity = remote_participants[0]
+            logger.info(f"Sending RPC to participant for code interpreter: {participant_identity}")
+            
+            response = await job_ctx.room.local_participant.perform_rpc(
+                destination_identity=participant_identity,
+                method="openCodeInterpreter",
+                payload=json.dumps({
+                    "question": question,
+                    "language": language,
+                    "type": "interpreter"
+                }),
+                response_timeout=10.0,
+            )
+            
+            logger.info(f"Code interpreter opened successfully for question: {question}")
+            context.userdata.total_questions_count += 1
+            context.userdata.questions_asked.append(f"Python Interpreter: {question}")
+            
+            # Don't say the question aloud - it will be displayed in the code interpreter
+            await context.session.say(
+                "I've opened a Python code interpreter for you. You can write and execute your code directly. Please solve the problem and submit your solution when ready."
+            )
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Failed to open code interpreter: {e}")
+            await context.session.say(
+                "I'm having trouble opening the code interpreter. Let me ask you the question verbally instead."
+            )
+            # Fall back to asking the question normally
+            context.userdata.total_questions_count += 1
+            context.userdata.questions_asked.append(f"Python (verbal): {question}")
+            return f"Error opening code interpreter: {str(e)}"
+
+    @function_tool()
+    async def analyze_submitted_code(self, context: RunContext[InterviewSessionData], code: str, language: str, explanation: str, question: str, execution_output: str = ""):
         """This tool is called when the candidate submits code from the editor. Analyze and provide feedback."""
         try:
             # Store the code submission
@@ -328,6 +376,7 @@ class TechnicalQuestionsAgent(Agent):
                 "code": code,
                 "language": language,
                 "explanation": explanation,
+                "execution_output": execution_output,
                 "timestamp": datetime.now().isoformat()
             }
             
@@ -339,12 +388,63 @@ class TechnicalQuestionsAgent(Agent):
             logger.info(f"Code submitted for question: {question}")
             logger.info(f"Language: {language}, Code length: {len(code)} chars")
             
-            # Provide feedback based on the code
-            await context.session.say(
-                f"Thank you for submitting your code! Let me review your solution. "
-                f"I can see you've written {len(code.split())} words of {language} code. "
-                f"{'Your explanation helps me understand your thought process.' if explanation else ''}"
-            )
+            # Actually analyze the submitted code
+            code_words = len(code.split()) if code.strip() else 0
+            
+            if not code.strip():
+                await context.session.say(
+                    f"I notice you submitted empty code. Please try to implement a solution to the problem. "
+                    f"Let me open another coding question for you to try."
+                )
+            elif code_words < 5:
+                await context.session.say(
+                    f"Your submission seems quite short with only {code_words} words. "
+                    f"Make sure you've implemented a complete solution. Let me continue with another question."
+                )
+            elif language.lower() == "python":
+                # Check for basic Python function structure
+                has_def = "def " in code
+                has_return = "return" in code
+                
+                if has_def and has_return:
+                    await context.session.say(
+                        f"Good! I can see you've implemented a Python function with a return statement. "
+                        f"Your code has {code_words} words and appears to have the basic structure needed. "
+                        f"{'Your explanation helps me understand your approach.' if explanation else ''} "
+                        f"Let me continue with another coding question."
+                    )
+                elif has_def:
+                    await context.session.say(
+                        f"I see you've defined a function, but it might be missing a return statement. "
+                        f"Make sure your function returns the expected result. Let me continue with another question."
+                    )
+                else:
+                    await context.session.say(
+                        f"I see you've written some Python code, but it doesn't appear to define a function as requested. "
+                        f"Remember to use 'def function_name():' to define functions. Let me continue with another question."
+                    )
+            else:
+                await context.session.say(
+                    f"Thank you for submitting your {language} code with {code_words} words. "
+                    f"{'Your explanation helps me understand your thought process.' if explanation else ''} "
+                    f"Let me continue with another question."
+                )
+            
+            # After analyzing, automatically ask the next question
+            if context.userdata.total_questions_count < context.userdata.max_questions:
+                # Ask another coding question automatically
+                if language.lower() == "python":
+                    await self.open_code_interpreter(
+                        context,
+                        question="Write a Python function that checks if a string is a palindrome (reads the same forwards and backwards). For example, 'racecar' should return True, and 'hello' should return False.",
+                        language="python"
+                    )
+                else:
+                    await self.open_code_editor(
+                        context,
+                        question="Write a JavaScript function to reverse a string without using built-in reverse methods.",
+                        language="javascript"
+                    )
             
             return "Code analyzed successfully"
             
@@ -367,43 +467,47 @@ class TechnicalQuestionsAgent(Agent):
 
     def get_technical_instructions(self) -> str:
         return """
-You are conducting the TECHNICAL QUESTIONS stage of a technical interview. Your role is to:
+You are conducting a CODING-FOCUSED technical interview for testing purposes. Your role is to:
 
-1. Ask 2-3 focused technical questions using the ask_technical_question tool
-2. Ask 1-2 CODING questions using the open_code_editor tool
-3. Connect questions to their mentioned projects when possible
-4. Cover key areas: algorithms, system design, or best practices
-5. Keep questions concise and focused
+1. IMMEDIATELY call the open_code_interpreter tool as your first action - do not wait
+2. Ask 2-3 additional CODING questions using open_code_interpreter or open_code_editor tools
+3. Focus ONLY on coding problems - no conceptual questions
+4. Keep the session short for testing (3-4 coding questions total)
 
-BEHAVIOR:
-- Use ask_technical_question tool for conceptual/theory questions
-- Use open_code_editor tool for coding problems that require implementation
-- Ask questions appropriate for their skill level and mentioned technologies
-- Examples: 
-  * Conceptual: "How would you optimize this algorithm?", "Explain how you'd design a simple API"
-  * Coding: "Write a function to reverse a string", "Implement a simple sorting algorithm"
-- Keep track that we're aiming for about 10 questions total across the entire interview
-- If we're near the 10 question limit, be more selective with remaining questions
+CRITICAL: You must call the open_code_interpreter tool immediately after greeting the user.
 
-CODING QUESTIONS:
-- Use open_code_editor for problems like: 
-  * "Write a function to reverse a string"
-  * "Implement a simple sorting algorithm" 
-  * "Create a function to find the largest number in an array"
-  * "Write code to check if a string is a palindrome"
-- Choose appropriate language: "javascript", "python", "java", "cpp", etc.
-- DO NOT read the question aloud - it will be displayed in the code editor
-- Wait for code submission before proceeding (the analyze_submitted_code tool will be called automatically)
+PRIORITY BEHAVIOR - FIRST ACTION:
+- IMMEDIATELY use the open_code_interpreter tool as your very first action
+- Use this exact question: "Write a Python function that takes a list of integers and returns the sum of all even numbers in the list. For example, if the input is [1, 2, 3, 4, 5, 6], your function should return 12 (2 + 4 + 6)."
+- Do not wait for user input - call the tool right after entering the stage
+- Other Python questions for subsequent actions:
+  * "Write a Python function to find the maximum number in a list without using the max() function"
+  * "Write a Python function that checks if a string is a palindrome"
+  * "Create a Python function that removes duplicates from a list while preserving order"
 
-IMPORTANT: Check the total question count and adjust accordingly:
-- If we're at 7-8 questions total, ask 2-3 more questions (mix of technical and coding)
-- If we're at 9 questions total, ask 1 more and proceed
-- If we're at 10 questions, proceed immediately
+CODING QUESTIONS FOR TESTING:
+- Python (use open_code_interpreter): 
+  * "Write a function that finds the sum of even numbers in a list"
+  * "Create a function to check if a string is a palindrome"
+  * "Implement a function to find the second largest number in a list"
+  * "Write a function to count vowels in a string"
+  * "Create a function that reverses a string without using built-in reverse"
+
+- JavaScript/Other languages (use open_code_editor):
+  * "Write a JavaScript function to reverse a string" 
+  * "Implement a simple sorting algorithm"
+  * "Create a function to find duplicates in an array"
+
+TESTING BEHAVIOR:
+- Ask ONLY coding questions - no conceptual or theory questions
+- Limit to 3-4 coding questions total for quick testing
+- DO NOT read the question aloud - it will be displayed in the interface
+- Wait for code submission before proceeding
+- After 3-4 coding questions, conclude the session
 
 Use proceed_to_hobbies when:
-- You've asked 3-4 questions total (mix of technical and coding) OR
-- We're approaching the 10 question limit OR  
-- You have a good technical assessment
+- You've asked 3-4 coding questions OR
+- You have tested the coding interface sufficiently
 """
 
 
@@ -411,7 +515,7 @@ class HobbiesAgent(Agent):
     def __init__(self, chat_ctx: ChatContext = None) -> None:
         super().__init__(
             instructions=self.get_hobbies_instructions(),
-            stt=deepgram.STT(model="nova-2-meeting"),
+            stt=openai.STT(model="whisper-1"),
             llm=openai.LLM(model="gpt-4o-mini"),
             tts=openai.TTS(),
             turn_detection=MultilingualModel(),
@@ -499,7 +603,7 @@ class InterviewConclusionAgent(Agent):
     def __init__(self, chat_ctx: ChatContext = None) -> None:
         super().__init__(
             instructions=self.get_conclusion_instructions(),
-            stt=deepgram.STT(model="nova-2-meeting"),
+            stt=openai.STT(model="whisper-1"),
             llm=openai.LLM(model="gpt-4o-mini"),
             tts=openai.TTS(),
             turn_detection=MultilingualModel(),
@@ -674,7 +778,8 @@ async def entrypoint(ctx: JobContext):
                     code=code,
                     language=language,
                     explanation=explanation,
-                    question=question
+                    question=question,
+                    execution_output=execution_output
                 )
             
             return json.dumps({"status": "success", "message": "Code received and analyzed"})
@@ -683,15 +788,47 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"Error handling code submission: {e}")
             return json.dumps({"status": "error", "message": str(e)})
 
-    # Register the RPC method
+    # Set up RPC handler for code interpreter submissions
+    async def handle_code_interpreter_submission(rpc_invocation):
+        """Handle code interpreter submissions from the frontend"""
+        try:
+            data = json.loads(rpc_invocation.payload)
+            code = data.get('code', '')
+            language = data.get('language', 'python')
+            explanation = data.get('explanation', '')
+            question = data.get('question', '')
+            execution_output = data.get('output', '')
+            
+            logger.info(f"Code interpreter submission: {len(code)} chars of {language} code")
+            logger.info(f"Execution output: {execution_output[:200]}..." if len(execution_output) > 200 else f"Execution output: {execution_output}")
+            
+            # Find the current agent and call analyze_submitted_code
+            current_agent = session.agent
+            if isinstance(current_agent, TechnicalQuestionsAgent):
+                await current_agent.analyze_submitted_code(
+                    session.run_context,
+                    code=code,
+                    language=language,
+                    explanation=explanation,
+                    question=question
+                )
+            
+            return json.dumps({"status": "success", "message": "Code interpreter submission received and analyzed"})
+            
+        except Exception as e:
+            logger.error(f"Error handling code interpreter submission: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
+
+    # Register the RPC methods
     ctx.room.local_participant.register_rpc_method("submitCode", handle_code_submission)
+    ctx.room.local_participant.register_rpc_method("submitCodeInterpreter", handle_code_interpreter_submission)
 
     # Trigger the on_metrics_collected function when metrics are collected
     session.on("metrics_collected", on_metrics_collected)
 
     await session.start(
         room=ctx.room,
-        agent=IntroductionAgent(),  # Start with the introduction agent
+        agent=TechnicalQuestionsAgent(),  # Start directly with technical questions for testing
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
         ),
