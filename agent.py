@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from enum import Enum
 from dataclasses import dataclass
+# from eleven_tts import ElevenLabsTTSe
 
 from dotenv import load_dotenv
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -28,6 +29,7 @@ from livekit.plugins import (
     openai,
     noise_cancellation,
     silero,
+    elevenlabs,
     groq,
     deepgram,
     cartesia
@@ -101,6 +103,7 @@ class IntroductionAgent(Agent):
             stt=openai.STT(model="whisper-1"),
             llm=openai.LLM(model="gpt-4o-mini"),
             tts=openai.TTS(),
+            # tts=ElevenLabsTTS(),
             turn_detection=MultilingualModel(),
             chat_ctx=chat_ctx
         )
@@ -242,6 +245,10 @@ class TechnicalQuestionsAgent(Agent):
             stt=openai.STT(model="whisper-1"),
             llm=openai.LLM(model="gpt-4o-mini"),
             tts=openai.TTS(),
+            # tts=elevenlabs.TTS(                # ← built‑in plugin
+            #     voice_id="sarah",  # optional
+            #     model="eleven_multilingual_v2",  # try a different model if you like
+            # ),            
             turn_detection=MultilingualModel(),
             chat_ctx=chat_ctx
         )
@@ -475,6 +482,7 @@ You are conducting a CODING-FOCUSED technical interview for testing purposes. Yo
 4. Keep the session short for testing (3-4 coding questions total)
 
 CRITICAL: You must call the open_code_interpreter tool immediately after greeting the user.
+CRITICAL: You must only use the word interpreter while u want the user to open the interpreter.
 
 PRIORITY BEHAVIOR - FIRST ACTION:
 - IMMEDIATELY use the open_code_interpreter tool as your very first action
